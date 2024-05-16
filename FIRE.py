@@ -22,14 +22,22 @@ import julia # set julia path below
 
 #### Methods for Setup
 
-fused_lasso_def = """
-using Lasso
-function fused_lasso(theta_bar,alpha)
-    fuse1d = fit(FusedLasso,theta_bar,alpha)
-    return coef(fuse1d)
-end
+from sklearn.linear_model import Lasso as SklearnLasso
+import numpy as np
 """
-Main.eval(fused_lasso_def)
+融合LASSO惩罚函数：
+fused_lasso函数实现了融合LASSO惩罚函数，用于在优化过程中鼓励相邻权重的相似性。
+"""
+def fused_lasso(theta_bar, alpha):
+    n = len(theta_bar)
+    D = np.eye(n) - np.eye(n, k=1)
+    D = D[:-1]  # 差分矩阵
+    def objective(w):
+        return 0.5 * np.sum((theta_bar - w) ** 2) + alpha * np.sum(np.abs(D @ w))
+    initial_guess = np.zeros(n)
+    result = scipy.optimize.minimize(objective, initial_guess, method='L-BFGS-B')
+    return result.x
+
 
 def get_tree_matrix_sparse(X,tree1):
     leaf_all = np.where(tree1.tree_.feature < 0)[0]
@@ -42,7 +50,7 @@ def get_tree_matrix_sparse(X,tree1):
     setdiff = list(set(leaf_all) - set(np.unique(leaves_index)))
     toadd = pd.DataFrame(np.column_stack((np.zeros(len(setdiff)),setdiff,np.zeros(len(setdiff)))),
                         columns = ['instance','node','value'])
-    df = df.append(toadd)
+    df = pd.concat([df, toadd])
     matrix_temp = pd.pivot_table(df, index = 'instance',columns = 'node',values = 'value').fillna(0)
     return csc_matrix(matrix_temp.values), matrix_temp.columns.values
 
@@ -58,22 +66,26 @@ def get_node_harvest_matrix_sparse(X,tree_list):
 
 ### Optimization Helper Methods
 
-@jit(nopython = True)
+# @jit(nopython = True)
 def compute_residual(y,y_full,M_temp,w_temp):
     return y - (y_full - M_temp@w_temp)
 
-@jit(nopython = True)
+# @jit(nopython = True)
 def evaluate_gradient(y,M,w):
     diff = y - M@w
     return -np.transpose(M)@diff
 
-@jit(nopython = True)
+# @jit(nopython = True)
 def soft_threshold(coef,alpha_lasso):
     temp = np.abs(coef) - alpha_lasso
     temp[temp<0] = 0
     return np.multiply(np.sign(coef),temp)
 
-@jit(nopython = True)
+# @jit(nopython = True)
+"""
+MCP惩罚函数：
+MCplus_threshold函数实现了MCP（Minimax Concave Penalty）惩罚函数，用于在优化过程中进行稀疏选择。
+"""
 def MCplus_threshold(coef,alpha_lasso,gamma, L):
     gamma1 = gamma/L
     c1 = np.abs(coef) <= alpha_lasso*gamma1
@@ -83,15 +95,15 @@ def MCplus_threshold(coef,alpha_lasso,gamma, L):
     temp[c2] = coef[c2]
     return temp
 
-@jit(nopython = True)
+# @jit(nopython = True)
 def l2_norm(r):
     return r@r
 
-@jit(nopython = True)
+# @jit(nopython = True)
 def l1_loss(w):
     return np.sum(np.abs(w))
 
-@jit(nopython = True)
+# @jit(nopython = True)
 def MCplus_loss(w,alpha_lasso,gamma):
     c1 = np.abs(w) <= alpha_lasso*gamma
     c2 = np.abs(w) > alpha_lasso*gamma
@@ -110,13 +122,13 @@ def evaluate_full_gradient(y,M,w):
     diff = y - M@w
     return -np.transpose(M)@diff
 
-@jit(nopython = True)
+# @jit(nopython = True)
 def BGS_selection(gradient,blocks):
     gradient_l2 = np.array([l2_norm(gradient[blocks[i]:blocks[i+1]]) for i in range(len(blocks)-1)])
     ind = np.argmax(gradient_l2)
     return ind
 
-@jit(nopython = True)
+# @jit(nopython = True)
 def shrinkage_operator(x,lambda1):
     cond = (np.abs(x)>=lambda1)
     shrunk_vector = np.zeros(len(x))
@@ -142,189 +154,106 @@ def MCP_steepest_direction(y,M,w,alpha_lasso,gamma, L_list):
     steepest_vector[w==0] = shrinkage_operator(gradient[w==0],alpha_lasso)
     return steepest_vector
 
-def MCP_fuse_steepest_direction(y,M,w,alpha_lasso,gamma,alpha_fuse,breakpoints, L_list):
-    gradient = evaluate_full_gradient(y,M,w)
+
+def MCP_fuse_steepest_direction(y, M, w, alpha_lasso, gamma, alpha_fuse, breakpoints, L_list):
+    gradient = evaluate_full_gradient(y, M, w)
     indicies = np.array(list(range(len(w))))
     dv = np.zeros(len(w))
 
-    #breakpoints 1 is negative
+    # 确保breakpoints是一个整数列表
+    breakpoints = np.array([int(bp) for bp in breakpoints], dtype=int)
+
     breakpoints2 = breakpoints[:-1].copy()
     breakpoints1 = breakpoints2 + 1
-    breakpoints1 = np.append(breakpoints1,indicies[0])
-    nonbreakpoints = np.array(list(set(indicies) - set(np.append(breakpoints1,breakpoints2))))
+    breakpoints1 = np.append(breakpoints1, indicies[0])
+    nonbreakpoints = np.array(list(set(indicies) - set(np.append(breakpoints1, breakpoints2))))
 
-    Dw = np.append(0,np.diff(w))
+    Dw = np.append(0, np.diff(w))
     Dw[breakpoints[:-1]] = 0
-    Dw1 = np.append(Dw[1:],0)
+    Dw1 = np.append(Dw[1:], 0)
 
+    # Update to nonbreakpoints
+    cond1 = nonbreakpoints[((w[nonbreakpoints] != 0) &
+                            (np.abs(w[nonbreakpoints]) <= alpha_lasso * gamma / L_list[nonbreakpoints]) &
+                            (Dw[nonbreakpoints] != 0) & (Dw1[nonbreakpoints] != 0))]
 
-    #### Update to nonbreakpoints
+    cond2 = nonbreakpoints[((w[nonbreakpoints] != 0) &
+                            (np.abs(w[nonbreakpoints]) <= alpha_lasso * gamma / L_list[nonbreakpoints]) &
+                            (Dw[nonbreakpoints] == 0) & (Dw1[nonbreakpoints] == 0))]
 
-    cond1 = nonbreakpoints[( (w[nonbreakpoints]!=0) & \
-                            (np.abs(w[nonbreakpoints])<=alpha_lasso*gamma/L_list[nonbreakpoints]) ) \
-                           &(Dw[nonbreakpoints] != 0)&(Dw1[nonbreakpoints] != 0)]
+    cond3 = nonbreakpoints[((w[nonbreakpoints] == 0) &
+                            (Dw[nonbreakpoints] != 0) & (Dw1[nonbreakpoints] == 0))]
 
-    cond2 = nonbreakpoints[((w[nonbreakpoints]!=0) & \
-                            (np.abs(w[nonbreakpoints])<=alpha_lasso*gamma/L_list[nonbreakpoints]))\
-                           &(Dw[nonbreakpoints] == 0)&(Dw1[nonbreakpoints] == 0)]
+    cond4 = nonbreakpoints[((w[nonbreakpoints] == 0) &
+                            (Dw[nonbreakpoints] == 0) & (Dw1[nonbreakpoints] != 0))]
 
-    cond3 = nonbreakpoints[(w[nonbreakpoints] == 0)&(Dw[nonbreakpoints] != 0)&(Dw1[nonbreakpoints] == 0)]
-    cond4 = nonbreakpoints[(w[nonbreakpoints] == 0)&(Dw[nonbreakpoints] == 0)&(Dw1[nonbreakpoints] != 0)]
-    cond5 = nonbreakpoints[(w[nonbreakpoints] == 0)&(Dw[nonbreakpoints] != 0)&(Dw1[nonbreakpoints] != 0)]
+    cond5 = nonbreakpoints[((w[nonbreakpoints] == 0) &
+                            (Dw[nonbreakpoints] != 0) & (Dw1[nonbreakpoints] != 0))]
 
-    cond6 = nonbreakpoints[((w[nonbreakpoints]!=0) &\
-                            (np.abs(w[nonbreakpoints])<=alpha_lasso*gamma/L_list[nonbreakpoints])) \
-                           &(Dw[nonbreakpoints] != 0)&(Dw1[nonbreakpoints] == 0)]
+    cond6 = nonbreakpoints[((w[nonbreakpoints] != 0) &
+                            (np.abs(w[nonbreakpoints]) <= alpha_lasso * gamma / L_list[nonbreakpoints]) &
+                            (Dw[nonbreakpoints] != 0) & (Dw1[nonbreakpoints] == 0))]
 
-    cond7 = nonbreakpoints[((w[nonbreakpoints]!=0) & \
-                            (np.abs(w[nonbreakpoints])<=alpha_lasso*gamma/L_list[nonbreakpoints])) \
-                           &(Dw[nonbreakpoints] == 0)&(Dw1[nonbreakpoints] != 0)]
+    cond7 = nonbreakpoints[((w[nonbreakpoints] != 0) &
+                            (np.abs(w[nonbreakpoints]) <= alpha_lasso * gamma / L_list[nonbreakpoints]) &
+                            (Dw[nonbreakpoints] == 0) & (Dw1[nonbreakpoints] != 0))]
 
-    cond8 = nonbreakpoints[(w[nonbreakpoints] == 0)&(Dw[nonbreakpoints] == 0)&(Dw1[nonbreakpoints] == 0)]
+    cond8 = nonbreakpoints[((w[nonbreakpoints] == 0) &
+                            (Dw[nonbreakpoints] == 0) & (Dw1[nonbreakpoints] == 0))]
 
+    cond9 = nonbreakpoints[(np.abs(w[nonbreakpoints]) > alpha_lasso * gamma / L_list[nonbreakpoints]) &
+                           (Dw[nonbreakpoints] != 0) & (Dw1[nonbreakpoints] != 0)]
 
+    cond10 = nonbreakpoints[(np.abs(w[nonbreakpoints]) > alpha_lasso * gamma / L_list[nonbreakpoints]) &
+                            (Dw[nonbreakpoints] == 0) & (Dw1[nonbreakpoints] == 0)]
 
-    cond9 = nonbreakpoints[(np.abs(w[nonbreakpoints])> alpha_lasso*gamma/L_list[nonbreakpoints])  \
-                           &(Dw[nonbreakpoints] != 0)&(Dw1[nonbreakpoints] != 0)]
-    cond10 = nonbreakpoints[(np.abs(w[nonbreakpoints])> alpha_lasso*gamma/L_list[nonbreakpoints])  \
-                           &(Dw[nonbreakpoints] == 0)&(Dw1[nonbreakpoints] == 0)]
-    cond11 = nonbreakpoints[(np.abs(w[nonbreakpoints])> alpha_lasso*gamma/L_list[nonbreakpoints])  \
-                           &(Dw[nonbreakpoints] != 0)&(Dw1[nonbreakpoints] == 0)]
-    cond12 = nonbreakpoints[(np.abs(w[nonbreakpoints])> alpha_lasso*gamma/L_list[nonbreakpoints])  \
-                           &(Dw[nonbreakpoints] == 0)&(Dw1[nonbreakpoints] != 0)]
+    cond11 = nonbreakpoints[(np.abs(w[nonbreakpoints]) > alpha_lasso * gamma / L_list[nonbreakpoints]) &
+                            (Dw[nonbreakpoints] != 0) & (Dw1[nonbreakpoints] == 0)]
 
+    cond12 = nonbreakpoints[(np.abs(w[nonbreakpoints]) > alpha_lasso * gamma / L_list[nonbreakpoints]) &
+                            (Dw[nonbreakpoints] == 0) & (Dw1[nonbreakpoints] != 0)]
 
-    dv[cond1] = gradient[cond1] \
-                    + alpha_fuse*np.sign(Dw[cond1]) \
-                    - alpha_fuse*np.sign(Dw1[cond1]) \
-                    + alpha_lasso* np.sign(w[cond1]) - w[cond1]/(gamma/L_list[cond1])
+    dv[cond1] = gradient[cond1] + alpha_fuse * np.sign(Dw[cond1]) - alpha_fuse * np.sign(
+        Dw1[cond1]) + alpha_lasso * np.sign(w[cond1]) - w[cond1] / (gamma / L_list[cond1])
+    dv[cond2] = shrinkage_operator(
+        gradient[cond2] + alpha_lasso * np.sign(w[cond2]) - w[cond2] / (gamma / L_list[cond2]), 2 * alpha_fuse)
+    dv[cond3] = shrinkage_operator(gradient[cond3] + alpha_fuse * np.sign(Dw[cond3]), alpha_lasso + alpha_fuse)
+    dv[cond4] = shrinkage_operator(gradient[cond4] - alpha_fuse * np.sign(Dw1[cond4]), alpha_lasso + alpha_fuse)
+    dv[cond5] = shrinkage_operator(gradient[cond5] + alpha_fuse * np.sign(Dw[cond5]) - alpha_fuse * np.sign(Dw1[cond5]),
+                                   alpha_lasso)
+    dv[cond6] = shrinkage_operator(
+        gradient[cond6] + alpha_fuse * np.sign(Dw[cond6]) + alpha_lasso * np.sign(w[cond6]) - w[cond6] / (
+                    gamma / L_list[cond6]), alpha_fuse)
+    dv[cond7] = shrinkage_operator(
+        gradient[cond7] - alpha_fuse * np.sign(Dw1[cond7]) + alpha_lasso * np.sign(w[cond7]) - w[cond7] / (
+                    gamma / L_list[cond7]), alpha_fuse)
+    dv[cond8] = shrinkage_operator(gradient[cond8], 2 * alpha_fuse + alpha_lasso)
+    dv[cond9] = gradient[cond9] + alpha_fuse * np.sign(Dw[cond9]) - alpha_fuse * np.sign(Dw1[cond9])
+    dv[cond10] = shrinkage_operator(gradient[cond10], 2 * alpha_fuse)
+    dv[cond11] = shrinkage_operator(gradient[cond11] + alpha_fuse * np.sign(Dw[cond11]), alpha_fuse)
+    dv[cond12] = gradient[cond12] - alpha_fuse * np.sign(Dw1[cond12])
 
-    dv[cond2] = shrinkage_operator(gradient[cond2] \
-                                       + alpha_lasso*np.sign(w[cond2]) - w[cond2]/(gamma/L_list[cond2]) \
-                                        , 2*alpha_fuse)
-
-    dv[cond3] = shrinkage_operator(gradient[cond3] \
-                                       + alpha_fuse*np.sign(Dw[cond3])
-                                        ,alpha_lasso + alpha_fuse)
-
-    dv[cond4] = shrinkage_operator(gradient[cond4] \
-                                       -alpha_fuse*np.sign(Dw1[cond4])
-                                        ,alpha_lasso + alpha_fuse)
-
-    dv[cond5] = shrinkage_operator(gradient[cond5] \
-                                       + alpha_fuse*np.sign(Dw[cond5]) \
-                                       - alpha_fuse*np.sign(Dw1[cond5])
-                                        , alpha_lasso)
-
-    dv[cond6] = shrinkage_operator(gradient[cond6] \
-                                       + alpha_fuse*np.sign(Dw[cond6]) \
-                                       + alpha_lasso*np.sign(w[cond6]) - w[cond6]/(gamma/L_list[cond6])
-                                        ,alpha_fuse)
-
-    dv[cond7] = shrinkage_operator(gradient[cond7] \
-                                       - alpha_fuse*np.sign(Dw1[cond7]) \
-                                       + alpha_lasso*np.sign(w[cond7]) - w[cond7]/(gamma/L_list[cond7])
-                                      ,alpha_fuse)
-
-    dv[cond8] = shrinkage_operator(gradient[cond8]
-                                      , 2*alpha_fuse + alpha_lasso)
-
-    dv[cond9] = gradient[cond9] \
-                    + alpha_fuse*np.sign(Dw[cond9]) \
-                    - alpha_fuse*np.sign(Dw1[cond9])
-
-    dv[cond10] = shrinkage_operator(gradient[cond10]
-                                        , 2*alpha_fuse)
-
-    dv[cond11] = shrinkage_operator(gradient[cond11] \
-                                       + alpha_fuse*np.sign(Dw[cond11]) \
-                                        ,alpha_fuse)
-
-    dv[cond12] = shrinkage_operator(gradient[cond12] \
-                                       - alpha_fuse*np.sign(Dw1[cond12]) \
-                                      ,alpha_fuse)
-
-    #### breakpoints 1
+    # breakpoints 1
     b1cond1 = breakpoints1[(w[breakpoints1] == 0) & (Dw1[breakpoints1] == 0)]
-
-    b1cond2 = breakpoints1[((w[breakpoints1]!=0) &\
-                            (np.abs(w[breakpoints1])<=alpha_lasso*gamma/L_list[breakpoints1]))\
-                           & (Dw1[breakpoints1] == 0)]
-
+    b1cond2 = breakpoints1[(w[breakpoints1] != 0) & (Dw1[breakpoints1] == 0)]
     b1cond3 = breakpoints1[(w[breakpoints1] == 0) & (Dw1[breakpoints1] != 0)]
+    b1cond4 = breakpoints1[(w[breakpoints1] != 0) & (Dw1[breakpoints1] != 0)]
 
-    b1cond4 = breakpoints1[((w[breakpoints1]!=0) &\
-                            (np.abs(w[breakpoints1])<=alpha_lasso*gamma/L_list[breakpoints1]))\
-                           & (Dw1[breakpoints1] != 0)]
+    dv[b1cond1] = shrinkage_operator(gradient[b1cond1], alpha_fuse + alpha_lasso)
+    dv[b1cond2] = shrinkage_operator(gradient[b1cond2] + alpha_lasso * np.sign(w[b1cond2]), alpha_fuse)
+    dv[b1cond3] = shrinkage_operator(gradient[b1cond3] - alpha_fuse * np.sign(Dw1[b1cond3]), alpha_lasso)
+    dv[b1cond4] = gradient[b1cond4] + alpha_lasso * np.sign(w[b1cond4]) - alpha_fuse * np.sign(Dw1[b1cond4])
 
-    b1cond5 = breakpoints1[(np.abs(w[breakpoints1])> alpha_lasso*gamma/L_list[breakpoints1])\
-                           & (Dw1[breakpoints1] == 0)]
-
-    b1cond6 = breakpoints1[(np.abs(w[breakpoints1])> alpha_lasso*gamma/L_list[breakpoints1])\
-                           & (Dw1[breakpoints1] != 0)]
-
-
-    dv[b1cond1] = shrinkage_operator(gradient[b1cond1],
-                                         alpha_fuse + alpha_lasso)
-
-    dv[b1cond2] = shrinkage_operator(gradient[b1cond2] \
-                                        + alpha_lasso*np.sign(w[b1cond2]) - w[b1cond2]/(gamma/L_list[b1cond2])
-                                        ,alpha_fuse)
-
-    dv[b1cond3] = shrinkage_operator(gradient[b1cond3] \
-                                        - alpha_fuse*np.sign(Dw1[b1cond3]),
-                                        alpha_lasso)
-
-    dv[b1cond4] = gradient[b1cond4] \
-                        + alpha_lasso*np.sign(w[b1cond4]) - w[b1cond4]/(gamma/L_list[b1cond4]) \
-                        - alpha_fuse*np.sign(Dw1[b1cond4])
-
-    dv[b1cond5] = shrinkage_operator(gradient[b1cond5]
-                                        ,alpha_fuse)
-
-    dv[b1cond6] = gradient[b1cond6] \
-                        - alpha_fuse*np.sign(Dw1[b1cond6])
-
-    ######### breakpoints2
+    # breakpoints 2
     b2cond1 = breakpoints2[(w[breakpoints2] == 0) & (Dw[breakpoints2] == 0)]
-
-    b2cond2 = breakpoints2[((w[breakpoints2]!=0) &\
-                            (np.abs(w[breakpoints2])<=alpha_lasso*gamma/L_list[breakpoints2]))\
-                           & (Dw[breakpoints2] == 0)]
-
+    b2cond2 = breakpoints2[(w[breakpoints2] != 0) & (Dw[breakpoints2] == 0)]
     b2cond3 = breakpoints2[(w[breakpoints2] == 0) & (Dw[breakpoints2] != 0)]
+    b2cond4 = breakpoints2[(w[breakpoints2] != 0) & (Dw[breakpoints2] != 0)]
 
-    b2cond4 = breakpoints2[((w[breakpoints2]!=0) &\
-                            (np.abs(w[breakpoints2])<=alpha_lasso*gamma/L_list[breakpoints2]))\
-                           & (Dw[breakpoints2] != 0)]
-
-    b2cond5 = breakpoints2[(np.abs(w[breakpoints2])> alpha_lasso*gamma/L_list[breakpoints2])\
-                           & (Dw[breakpoints2] == 0)]
-
-    b2cond6 = breakpoints2[(np.abs(w[breakpoints2]) > alpha_lasso*gamma/L_list[breakpoints2]) \
-                           & (Dw[breakpoints2] != 0)]
-
-    dv[b2cond1] = shrinkage_operator(gradient[b2cond1],
-                                            alpha_fuse + alpha_lasso)
-
-    dv[b2cond2] = shrinkage_operator(gradient[b2cond2] \
-                                             + alpha_lasso*np.sign(w[b2cond2]) - w[b2cond2]/(gamma/L_list[b2cond2]),
-                                            alpha_fuse)
-
-    dv[b2cond3] = shrinkage_operator(gradient[b2cond3] \
-                                            + alpha_fuse*np.sign(Dw[b2cond3]),
-                                            alpha_lasso)
-
-    dv[b2cond4] = gradient[b2cond4] \
-                            + alpha_lasso*np.sign(w[b2cond4]) - w[b2cond4]/(gamma/L_list[b2cond4]) \
-                            + alpha_fuse*np.sign(Dw[b2cond4])
-
-
-    dv[b2cond5] = shrinkage_operator(gradient[b2cond5]
-                                            ,alpha_fuse)
-
-    dv[b2cond6] = gradient[b2cond6] \
-                            + alpha_fuse*np.sign(Dw[b2cond6])
+    dv[b2cond1] = shrinkage_operator(gradient[b2cond1], alpha_fuse + alpha_lasso)
+    dv[b2cond2] = shrinkage_operator(gradient[b2cond2] + alpha_lasso * np.sign(w[b2cond2]), alpha_fuse)
+    dv[b2cond3] = shrinkage_operator(gradient[b2cond3] + alpha_fuse * np.sign(Dw[b2cond3]), alpha_lasso)
+    dv[b2cond4] = gradient[b2cond4] + alpha_lasso * np.sign(w[b2cond4]) + alpha_fuse * np.sign(Dw[b2cond4])
 
     return dv
 
@@ -436,8 +365,11 @@ def l1_fuse_steepest_direction(y,M,w,alpha_lasso,alpha_fuse,breakpoints):
     return dv
 
 
-### Optimization Functions
-
+### Optimization Functions 优化算法
+"""
+l1_GBCD函数：
+实现了带有L1正则化的块坐标下降（GBCD）优化算法。
+"""
 def l1_GBCD(M,y,blocks,alpha_lasso,num_prox_iters,threshold,warm_start = []):
 
     if len(warm_start) == 0:
@@ -488,7 +420,10 @@ def l1_GBCD(M,y,blocks,alpha_lasso,num_prox_iters,threshold,warm_start = []):
         iter1 = iter1 + 1
 
     return w, iter1, loss_sequence
-
+"""
+MCP_GBCD函数：
+实现了带有MCP正则化的块坐标下降（GBCD）优化算法。
+"""
 def MCP_GBCD(M,y,blocks,alpha_lasso,gamma,num_prox_iters,threshold,warm_start = []):
 
     if len(warm_start) == 0:
@@ -548,85 +483,93 @@ def MCP_GBCD(M,y,blocks,alpha_lasso,gamma,num_prox_iters,threshold,warm_start = 
         iter1 = iter1 + 1
 
     return w, iter1, loss_sequence
-
-def l1_fuse_GBCD(M,y,blocks,alpha_lasso,alpha_fuse,breakpoints, num_prox_iters,threshold, warm_start = []):
-    fused_ind = np.array(list(set(range(1,M.shape[1])) - set(breakpoints+1)))
+"""
+l1_fuse_GBCD函数：
+实现了带有L1和融合LASSO正则化的块坐标下降（GBCD）优化算法。
+"""
+def l1_fuse_GBCD(M, y, blocks, alpha_lasso, alpha_fuse, breakpoints, num_prox_iters, threshold, warm_start=[]):
+    fused_ind = np.array(list(set(range(1, M.shape[1])) - set(breakpoints + 1)))
     if len(warm_start) == 0:
         w = np.zeros(M.shape[1])
         y_update = np.zeros(len(y))
     else:
         w = warm_start.copy()
-        y_update = M@w
+        y_update = M @ w
 
-    nblocks = len(blocks)-1
+    nblocks = len(blocks) - 1
     iter1 = 0
     converged = False
     loss_sequence = []
     L_dict = {}
 
-    while converged == False:
-
-        gradient = l1_fuse_steepest_direction(y,M,w,alpha_lasso,alpha_fuse,breakpoints)
-        ind = BGS_selection(gradient,blocks)
+    while not converged:
+        gradient = l1_fuse_steepest_direction(y, M, w, alpha_lasso, alpha_fuse, breakpoints)
+        ind = BGS_selection(gradient, blocks)
 
         ind_start = blocks[ind]
-        ind_end = blocks[ind+1]
+        ind_end = blocks[ind + 1]
 
         w_temp = w[ind_start:ind_end]
-        M_temp = np.array(M[:,ind_start:ind_end].todense())
-        y_temp = compute_residual(y,y_update,M_temp,w_temp)
+        M_temp = np.array(M[:, ind_start:ind_end].todense())
+        y_temp = compute_residual(y, y_update, M_temp, w_temp)
 
         if ind in L_dict:
             L = L_dict[ind]
         else:
-            L = scipy.sparse.linalg.eigsh(np.transpose(M_temp)@M_temp,
-                k = 1, which = 'LM', return_eigenvectors  = False)[0]
+            L = scipy.sparse.linalg.eigsh(np.transpose(M_temp) @ M_temp,
+                                          k=1, which='LM', return_eigenvectors=False)[0]
             L_dict[ind] = L
 
         for _ in range(num_prox_iters):
-            theta_bar = w_temp - (1/L)*evaluate_gradient(y_temp,M_temp,w_temp)
-            coef = Main.fused_lasso(theta_bar,alpha_fuse/L)
+            theta_bar = w_temp - (1 / L) * evaluate_gradient(y_temp, M_temp, w_temp)
+            coef = fused_lasso(theta_bar, alpha_fuse / L)
             if alpha_lasso == 0:
                 w_temp = coef
             else:
-                w_temp = soft_threshold(coef,alpha_lasso/L)
+                w_temp = soft_threshold(coef, alpha_lasso / L)
 
         w[ind_start:ind_end] = w_temp
-        r = y_temp - M_temp@w_temp #trick to avoid computing M@w, y_temp differences out original
-        y_update = y - r # another trick to avoid computing the full M@w on the residual step
-        loss = (l2_norm(r)/2 + alpha_lasso*l1_loss(w) + alpha_fuse*l1_fuse_loss(w,fused_ind))/len(r)
+        r = y_temp - M_temp @ w_temp  # trick to avoid computing M@w, y_temp differences out original
+        y_update = y - r  # another trick to avoid computing the full M@w on the residual step
+        loss = (l2_norm(r) / 2 + alpha_lasso * l1_loss(w) + alpha_fuse * l1_fuse_loss(w, fused_ind)) / len(r)
         loss_sequence.append(loss)
 
         if len(loss_sequence) >= 2:
-            converged = np.abs(loss_sequence[-1]-loss_sequence[-2])<= threshold
+            converged = np.abs(loss_sequence[-1] - loss_sequence[-2]) <= threshold
 
-        iter1 = iter1 + 1
+        iter1 += 1
 
     return w, iter1, loss_sequence
 
 
-def MCP_fuse_GBCD(M,y,blocks,alpha_lasso,gamma,alpha_fuse,breakpoints, num_prox_iters,threshold, warm_start = []):
+def MCP_fuse_GBCD(M, y, blocks, alpha_lasso, gamma, alpha_fuse, breakpoints, num_prox_iters, threshold, warm_start=[]):
+    if not isinstance(breakpoints, list):
+        breakpoints = list(breakpoints)
 
-    fused_ind = np.array(list(set(range(1,M.shape[1])) - set(breakpoints+1)))
+    # 确保breakpoints是整数列表
+    breakpoints = [int(bp) for bp in breakpoints]
+
+    fused_ind = np.array(list(set(range(1, M.shape[1])) - set(breakpoints) - set(np.array(breakpoints) + 1)))
+
     if len(warm_start) == 0:
         w = np.zeros(M.shape[1])
         y_update = np.zeros(len(y))
     else:
         w = warm_start.copy()
-        y_update = M@w
+        y_update = M @ w
 
-    nblocks = len(blocks)-1
+    nblocks = len(blocks) - 1
 
     L_dict = {}
     L_list = np.zeros(M.shape[1])
 
-    for ind1 in range(0,nblocks):
+    for ind1 in range(nblocks):
         ind_start = blocks[ind1]
-        ind_end = blocks[ind1+1]
+        ind_end = blocks[ind1 + 1]
 
-        M_temp = np.array(M[:,ind_start:ind_end].todense())
-        L = scipy.sparse.linalg.eigsh(np.transpose(M_temp)@M_temp,
-                    k = 1, which = 'LM', return_eigenvectors  = False)[0]
+        M_temp = np.array(M[:, ind_start:ind_end].todense())
+        L = scipy.sparse.linalg.eigsh(np.transpose(M_temp) @ M_temp,
+                                      k=1, which='LM', return_eigenvectors=False)[0]
         L_dict[ind1] = L
         L_list[ind_start:ind_end] = L
 
@@ -635,37 +578,36 @@ def MCP_fuse_GBCD(M,y,blocks,alpha_lasso,gamma,alpha_fuse,breakpoints, num_prox_
     loss_sequence = []
     mcp_losses = np.zeros(nblocks)
 
-    while converged == False:
-
-        dv = MCP_fuse_steepest_direction(y,M,w,alpha_lasso,gamma,alpha_fuse,breakpoints, L_list)
-        ind = BGS_selection(dv,blocks)
+    while not converged:
+        dv = MCP_fuse_steepest_direction(y, M, w, alpha_lasso, gamma, alpha_fuse, breakpoints, L_list)
+        ind = BGS_selection(dv, blocks)
         ind_start = blocks[ind]
-        ind_end = blocks[ind+1]
+        ind_end = blocks[ind + 1]
 
         w_temp = w[ind_start:ind_end]
-        M_temp = np.array(M[:,ind_start:ind_end].todense())
-        y_temp = compute_residual(y,y_update,M_temp,w_temp)
+        M_temp = np.array(M[:, ind_start:ind_end].todense())
+        y_temp = compute_residual(y, y_update, M_temp, w_temp)
 
         L = L_dict[ind]
         for _ in range(num_prox_iters):
-            theta_bar = w_temp - (1/L)*evaluate_gradient(y_temp,M_temp,w_temp)
-            coef = Main.fused_lasso(theta_bar,alpha_fuse/L)
+            theta_bar = w_temp - (1 / L) * evaluate_gradient(y_temp, M_temp, w_temp)
+            coef = fused_lasso(theta_bar, alpha_fuse / L)
             if alpha_lasso == 0:
                 w_temp = coef
             else:
-                w_temp = MCplus_threshold(coef,alpha_lasso,gamma, L)
+                w_temp = MCplus_threshold(coef, alpha_lasso, gamma, L)
 
         w[ind_start:ind_end] = w_temp
-        r = y_temp - M_temp@w_temp #trick to avoid computing M@w, y_temp differences out original
-        y_update = y - r # another trick to avoid computing the full M@w on the residual step
+        r = y_temp - M_temp @ w_temp  # trick to avoid computing M@w, y_temp differences out original
+        y_update = y - r  # another trick to avoid computing the full M@w on the residual step
 
-        mcp_losses[ind] = MCplus_loss(w_temp,alpha_lasso,gamma/L) # store regularizer loss
-        loss = (l2_norm(r)/2  + np.sum(mcp_losses) + alpha_fuse*l1_fuse_loss(w,fused_ind))/len(r)
+        mcp_losses[ind] = MCplus_loss(w_temp, alpha_lasso, gamma / L)  # store regularizer loss
+        loss = (l2_norm(r) / 2 + np.sum(mcp_losses) + alpha_fuse * l1_fuse_loss(w, fused_ind)) / len(r)
         loss_sequence.append(loss)
 
         if len(loss_sequence) >= 2:
-            converged = np.abs(loss_sequence[-1]-loss_sequence[-2])<= threshold
-        iter1 = iter1 + 1
+            converged = np.abs(loss_sequence[-1] - loss_sequence[-2]) <= threshold
+        iter1 += 1
 
     return w, iter1, loss_sequence
 
